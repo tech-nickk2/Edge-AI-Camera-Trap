@@ -4,5 +4,5 @@ ei_*/
 __pycache__/
 
 # camera trap output and local models
-camera-trap-app/captures/
+camera-trap-app/data/
 *.eim

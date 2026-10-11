@@ -77,10 +77,10 @@ there is something to look at.
 ```
 edge-ai-camera-trap/
 ├── camera-trap-app/      Arduino App Lab app: runs on the UNO Q
-│   ├── app.yaml          App Lab app definition
+│   ├── app.yaml          App Lab app definition: web UI + two AI bricks and their models
+│   ├── assets/           test web page (served on port 7000)
 │   ├── python/main.py    the detector → classifier cascade (Linux side)
-│   ├── sketch/sketch.ino PIR, LDR and IR LED control (microcontroller side)
-│   └── models/           optional place for .eim model files
+│   └── sketch/           sketch.ino + sketch.yaml: PIR, LDR and IR LEDs (microcontroller side)
 ├── training/             data scripts: run on a PC, NOT on the UNO Q
 │   ├── lila_sample_puller.py   real camera trap data from LILA BC
 │   ├── synth_paste.py          synthetic person/vehicle images
@@ -248,6 +248,20 @@ same way.
 
 ## Part 3: The cascade app (Arduino UNO Q)
 
+### How the app is built
+
+The app follows App Lab's normal structure. The two AI models each run in their own
+**brick**, a ready-made service App Lab starts in its own container:
+
+| Brick | Model | Used by `main.py` as |
+|---|---|---|
+| `arduino:object_detection` | the detector (animal / person / vehicle) | `ObjectDetection().detect(image)` |
+| `arduino:image_classification` | the species classifier | `ImageClassification().classify(image)` |
+
+Which Edge Impulse model each brick loads is set in `app.yaml` (or in App Lab, in the brick's
+**AI Models** tab). The camera is read with App Lab's `Camera` peripheral, and the sketch and
+Python talk over the **Bridge**.
+
 ### What the two files do
 
 **`sketch/sketch.ino`** runs on the microcontroller and handles everything time-critical:
@@ -265,27 +279,27 @@ same way.
 
 **`python/main.py`** runs on the Linux side and does the AI work:
 
-1. **Finding the models.** On start-up it looks in the app's `models/` folder and in App
-   Lab's download folder (`/home/arduino/.arduino-bricks/models/custom-ei/`). It loads every
-   `.eim` file, reads each one's type, and keeps the most recently downloaded **object
-   detection** model as the detector and the most recently downloaded **classification**
-   model as the classifier. It prints which ones it chose.
+1. **Starting up.** It connects to the two bricks, asks each for its model's details (name,
+   input size, how images were resized in training, labels) and prints them, so you can
+   confirm the right models are loaded. Then it starts the camera.
 2. **Waiting.** It waits for a `motion` message from the sketch. In `timer` mode it captures
    every few seconds instead, which is handy for testing without sensors.
 3. **Capturing.** It throws away a few frames so the camera's exposure can adjust (for
    example to the IR LEDs), then captures a burst of 3 frames.
-4. **Stage 1, detector.** It shrinks each frame to the model's 320×320 input the same way
-   Edge Impulse did in training ("fit longest axis": scale, then pad with black), runs the
-   detector, drops boxes below `DETECTOR_THRESHOLD` (0.5), and maps the remaining boxes back
-   onto the full-resolution frame.
+4. **Stage 1, detector.** It shrinks each frame to the detector's input size (e.g. 320×320)
+   exactly as Edge Impulse did in training (the model reports its resize mode, e.g. "fit
+   longest axis": scale, then pad with black) and sends it to the object detection brick.
+   Boxes below `DETECTOR_THRESHOLD` (0.5) are dropped, and the rest are mapped back onto the
+   full-resolution frame.
 5. **Stage 2, classifier.** For every **animal** box it cuts that area out of the
-   full-resolution frame with 25% padding (the same padding as the training crops) and runs
-   the species classifier. Below `CLASSIFIER_THRESHOLD` (0.6) the species is reported as
-   `uncertain` instead of a guess.
-6. **Saving.** Frames with detections are saved twice in `captures/<date>/`: a **clean
-   copy** (to add to the training data later) and a **labelled copy** with boxes and names.
-   Empty frames aren't saved, but each one gets a line in `captures/log.csv`, so you can
-   see how many false triggers were filtered out.
+   full-resolution frame with 25% padding (the same padding as the training crops) and sends
+   it to the image classification brick. Below `CLASSIFIER_THRESHOLD` (0.6) the species is
+   reported as `uncertain` instead of a guess.
+6. **Saving.** Frames with detections are saved twice in `data/captures/<date>/` (`data` is
+   App Lab's folder for an app's own files): a **clean copy** (to add to the training data
+   later) and a **labelled copy** with boxes and names. Empty frames aren't saved, but each
+   one gets a line in `data/captures/log.csv`, so you can see how many false triggers were
+   filtered out.
 7. **Tidying up.** It switches the IR LEDs off and ignores motion that happened while it was
    busy.
 
@@ -322,17 +336,28 @@ filter that blocks it, so use a NoIR camera or remove the filter.
    classifier to the board. To use the published models, first clone the public Edge
    Impulse projects ([detector](<DETECTOR PROJECT LINK>),
    [species classifier](<CLASSIFIER PROJECT LINK>)) into your own account.
-3. **Run.** Open **camera-trap** in App Lab and click **Run**. The log should show:
+3. **Pick the models.** Put the two model ids (their folder names in
+   `~/.arduino-bricks/models/custom-ei/`) into `app.yaml`, which also sets each model's
+   `.eim` path and shares the whole `custom-ei` folder with both bricks. That last part
+   matters: App Lab shares only one model folder per app, so with two custom models one
+   brick would otherwise not find its model.
+   Details: [camera-trap-app/README.md](camera-trap-app/README.md#3-pick-the-models-in-the-app).
+4. **Run.** Click **Run**. The Python output (`docker logs <app>-main-1` over SSH) should show:
 
    ```
-   Using detector: .../ei-model-XXXXXXX-N/model.eim
-   Using classifier: .../ei-model-YYYYYYY-N/model.eim
-   Camera trap ready (pir mode). Saving to .../captures
+   Starting models ...
+     ObjectDetection: <detector project> (project 1119962), type=object_detection, input=320x320, ...
+     ImageClassification: <species project> (project 1121401), type=classification, input=160x160, ...
+   Camera trap ready (pir mode). Saving to /app/data/captures
    [14:02:11] pir trigger (night=False, light=612)
      frame 0: animal/zebra 0.87 (1.2s)
    ```
 
-4. **Test step by step:**
+5. **Open the test page** at `http://<board-name>.local:7000`: live camera, a **Capture now**
+   button, trigger-mode switch, threshold sliders, live sensor readings, IR LED test and every
+   result with its labelled frames. See
+   [camera-trap-app/README.md](camera-trap-app/README.md#5-test-it-from-the-web-page).
+6. **Test step by step:**
    - Start with `TRIGGER_MODE = "timer"` and no sensors attached. Point the camera at a
      printed or on-screen animal photo.
    - Wire the sensors, switch back to `"pir"`, and walk in front of the camera.
@@ -341,7 +366,7 @@ filter that blocks it, so use a NoIR camera or remove the filter.
 
 Settings and troubleshooting: [camera-trap-app/README.md](camera-trap-app/README.md).
 
-<!-- Add a labelled output photo from captures/ here -->
+<!-- Add a labelled output photo from data/captures/ here -->
 ![Example labelled capture](images/example-capture.jpg)
 
 ---

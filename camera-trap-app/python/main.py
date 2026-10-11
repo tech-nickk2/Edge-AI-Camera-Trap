@@ -8,36 +8,42 @@ Flow on every trigger:
   species classifier -> labelled photos + a CSV log are saved; empty frames are
   discarded -> the IR LEDs are switched off again.
 
-Models: App Lab downloads Edge Impulse models to
-/home/arduino/.arduino-bricks/models/custom-ei/<ei-model-PROJECT-VERSION>/model.eim.
-This script inspects every .eim it finds there (and in the app's own models/ folder)
-and picks the most recently downloaded object detection model as the detector and
-the most recently downloaded classification model as the classifier. Set
-DETECTOR_MODEL / CLASSIFIER_MODEL below to force specific files.
+The two models run in App Lab bricks, each in its own container:
+  arduino:object_detection      -> the detector           (model set in app.yaml)
+  arduino:image_classification  -> the species classifier (model set in app.yaml)
+A test web page (arduino:web_ui brick, files in ../assets) shows the live camera, every
+result, live sensor readings and the statistics, and lets you capture on demand, switch
+the trigger mode, change the thresholds and test the IR LEDs. Open http://<board>:7000
 """
 
+import base64
+import collections
 import csv
 import datetime
-import glob
 import os
 import queue
+import threading
 import time
 
 import cv2
 import numpy as np
-from edge_impulse_linux.image import ImageImpulseRunner
+import requests
+
+from arduino.app_utils import App, Bridge
+from arduino.app_bricks.object_detection import ObjectDetection
+from arduino.app_bricks.image_classification import ImageClassification
+from arduino.app_bricks.web_ui import WebUI
 
 try:
-    from arduino.app_utils import App, Bridge
-except ImportError:  # running outside App Lab (e.g. over SSH): timer mode only
-    App = Bridge = None
+    from arduino.app_peripherals.camera import Camera
+except ImportError:  # older App Lab without the Camera peripheral (no live stream then)
+    Camera = None
 
 # ------------------------------------------------------------------ settings
 
-TRIGGER_MODE = "pir"         # "pir" = wait for the PIR sensor, "timer" = capture every TIMER_INTERVAL_S
-TIMER_INTERVAL_S = 10        # desk testing without the sensors wired up
+TRIGGER_MODE = "pir"         # "pir", "timer" (every TIMER_INTERVAL_S) or "manual" (web page button only)
+TIMER_INTERVAL_S = 10
 
-CAMERA_INDEX = 0             # /dev/video0
 CAPTURE_WIDTH, CAPTURE_HEIGHT = 1280, 720
 WARMUP_FRAMES = 5            # frames thrown away after a trigger so exposure adapts (e.g. to the IR LEDs)
 BURST_FRAMES = 3             # frames analysed per trigger
@@ -48,186 +54,249 @@ CLASSIFIER_THRESHOLD = 0.6   # below this the species is reported as "uncertain"
 CROP_PAD = 0.25              # padding around animal boxes; matches the training crops
 
 SAVE_EMPTY = False           # keep frames where nothing was detected (normally discarded)
+SENSOR_POLL_S = 1.0          # how often the web page's sensor readings are refreshed
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_DIRS = [os.path.join(APP_DIR, "models"), "/home/arduino/.arduino-bricks/models/custom-ei"]
-DETECTOR_MODEL = None        # e.g. "/home/arduino/.arduino-bricks/models/custom-ei/ei-model-1119962-1/model.eim"
-CLASSIFIER_MODEL = None
-OUT_DIR = os.path.join(APP_DIR, "captures")
+OUT_DIR = os.path.join(APP_DIR, "data", "captures")   # "data" is App Lab's persistent app folder
 
 
-# -------------------------------------------------------------------- models
+# ------------------------------------------------------------ model helpers
 
-def load_runner(path):
-    runner = ImageImpulseRunner(path)
-    info = runner.init()
-    return runner, info
-
-
-def describe(info):
+def model_params(brick):
+    """Input size, resize mode and a short description of the model behind a brick."""
+    info = requests.get(f"{brick.url}/api/info", timeout=10).json()
+    p = info.get("modelParameters", {})
     project = info.get("project", {})
-    params = info.get("model_parameters", {})
-    return (f"{project.get('owner', '?')} / {project.get('name', '?')} "
-            f"(project {project.get('id', '?')}, v{project.get('deploy_version', '?')}), "
-            f"type={params.get('model_type', '?')}, "
-            f"input={params.get('image_input_width')}x{params.get('image_input_height')}, "
-            f"labels={params.get('labels')}")
+    desc = {"name": project.get("name", "?"), "project": project.get("id", "?"),
+            "type": p.get("model_type"), "input": f"{p.get('image_input_width')}x{p.get('image_input_height')}",
+            "resize": p.get("image_resize_mode", "not reported"), "labels": p.get("labels", [])}
+    print(f"  {type(brick).__name__}: {desc}")
+    return (p["image_input_width"], p["image_input_height"], p.get("image_resize_mode", "squash")), desc
 
 
-def find_models():
-    """Return ((detector_runner, info), (classifier_runner, info))."""
-    if DETECTOR_MODEL and CLASSIFIER_MODEL:
-        det, cls = load_runner(DETECTOR_MODEL), load_runner(CLASSIFIER_MODEL)
-        print("Detector:  ", describe(det[1]))
-        print("Classifier:", describe(cls[1]))
-        return det, cls
-
-    paths = []
-    for d in MODEL_DIRS:
-        paths += glob.glob(os.path.join(d, "**", "*.eim"), recursive=True)
-    if not paths:
-        raise SystemExit(f"No .eim models found in {MODEL_DIRS}. Download them in App Lab first, "
-                         f"or copy them into {os.path.join(APP_DIR, 'models')}.")
-
-    # newest download of each model type wins
-    best = {}
-    print("Models found:")
-    for path in sorted(paths, key=os.path.getmtime):
-        try:
-            runner, info = load_runner(path)
-        except Exception as e:
-            print(f"  {path}: could not load ({e})")
-            continue
-        model_type = info.get("model_parameters", {}).get("model_type", "")
-        kind = "detector" if "object_detection" in model_type else \
-               "classifier" if model_type == "classification" else None
-        print(f"  {path}\n    {describe(info)}")
-        if kind is None:
-            runner.stop()
-            continue
-        if kind in best:
-            best[kind][0].stop()
-        best[kind] = (runner, info, path)
-
-    if "detector" not in best or "classifier" not in best:
-        raise SystemExit("Need one object detection model and one classification model.")
-    for kind in ("detector", "classifier"):
-        print(f"Using {kind}: {best[kind][2]}")
-    return best["detector"][:2], best["classifier"][:2]
+def to_model_input(bgr, width, height, mode):
+    """Resize a frame exactly as Edge Impulse Studio did for this model. Returns the
+    resized image and the transform model_xy = frame_xy * scale + offset, so detector
+    boxes can be mapped back onto the full-resolution frame."""
+    H, W = bgr.shape[:2]
+    if mode == "fit-longest":      # scale to fit inside, pad with black
+        s = min(width / W, height / H)
+        nw, nh = int(W * s), int(H * s)
+        top, left = (height - nh) // 2, (width - nw) // 2
+        img = cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+        img = cv2.copyMakeBorder(img, top, height - nh - top, left, width - nw - left,
+                                 cv2.BORDER_CONSTANT, value=0)
+        return img, (s, s, left, top)
+    if mode == "fit-shortest":     # scale to cover, crop the centre
+        s = max(width / W, height / H)
+        nw, nh = int(np.ceil(W * s)), int(np.ceil(H * s))
+        cx, cy = (nw - width) // 2, (nh - height) // 2
+        img = cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_AREA)[cy:cy + height, cx:cx + width]
+        return img, (s, s, -cx, -cy)
+    img = cv2.resize(bgr, (width, height), interpolation=cv2.INTER_AREA)   # "squash"
+    return img, (width / W, height / H, 0, 0)
 
 
-def input_size(info):
-    p = info["model_parameters"]
-    return p["image_input_width"], p["image_input_height"]
+def png_bytes(bgr):
+    ok, buf = cv2.imencode(".png", bgr)
+    return buf.tobytes() if ok else None
 
 
-def letterbox(img, width, height):
-    """Studio's "Fit longest axis": scale to fit, pad the rest with black.
-    Returns the padded image plus the scale and offsets needed to map boxes back."""
-    h, w = img.shape[:2]
-    s = min(width / w, height / h)
-    nw, nh = max(1, round(w * s)), max(1, round(h * s))
-    canvas = np.zeros((height, width, 3), np.uint8)
-    x0, y0 = (width - nw) // 2, (height - nh) // 2
-    canvas[y0:y0 + nh, x0:x0 + nw] = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
-    return canvas, s, x0, y0
-
-
-def detect(runner, info, rgb):
-    """Run the detector on a full-resolution RGB frame; boxes come back in frame pixels."""
-    w, h = input_size(info)
-    canvas, s, x0, y0 = letterbox(rgb, w, h)
-    features, _ = runner.get_features_from_image(canvas)
-    result = runner.classify(features)["result"]
-    boxes = []
-    for b in result.get("bounding_boxes", []):
-        if b["value"] < DETECTOR_THRESHOLD:
-            continue
-        boxes.append({
-            "label": b["label"], "conf": b["value"],
-            "x": (b["x"] - x0) / s, "y": (b["y"] - y0) / s,
-            "w": b["width"] / s, "h": b["height"] / s,
-        })
-    return boxes
-
-
-def classify_crop(runner, info, rgb, box):
-    """Crop the box (padded like the training crops) and return (species, confidence)."""
-    H, W = rgb.shape[:2]
-    px, py = box["w"] * CROP_PAD, box["h"] * CROP_PAD
-    x1, y1 = max(0, int(box["x"] - px)), max(0, int(box["y"] - py))
-    x2, y2 = min(W, int(box["x"] + box["w"] + px)), min(H, int(box["y"] + box["h"] + py))
-    if x2 - x1 < 4 or y2 - y1 < 4:
-        return None, 0.0
-    w, h = input_size(info)
-    canvas, _, _, _ = letterbox(rgb[y1:y2, x1:x2], w, h)
-    features, _ = runner.get_features_from_image(canvas)
-    scores = runner.classify(features)["result"]["classification"]
-    species, conf = max(scores.items(), key=lambda kv: kv[1])
-    return species, conf
+def jpeg_data_url(bgr, max_width=640, quality=75):
+    """Small JPEG preview for the web page."""
+    h, w = bgr.shape[:2]
+    if w > max_width:
+        bgr = cv2.resize(bgr, (max_width, int(h * max_width / w)), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    return "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode() if ok else None
 
 
 # ---------------------------------------------------------------- the trap
 
 class CameraTrap:
     def __init__(self):
-        (self.det, self.det_info), (self.cls, self.cls_info) = find_models()
-        self.cam = cv2.VideoCapture(CAMERA_INDEX)
-        if not self.cam.isOpened():
-            raise SystemExit(f"Could not open camera {CAMERA_INDEX}")
-        self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
-        self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
-        self.cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.mode = TRIGGER_MODE
+        self.det_thr = DETECTOR_THRESHOLD
+        self.cls_thr = CLASSIFIER_THRESHOLD
+        self.stats = collections.Counter()
+        self.species_counts = collections.Counter()
+        self.recent = collections.deque(maxlen=8)   # last results, re-sent to newly opened pages
+        self.sensors = None
+        self.busy = False
         self.events = queue.Queue()
         self.last_timer = 0.0
+        self.last_poll = 0.0
+        self.bridge_lock = threading.Lock()
+        self.bridge_warned = set()
+
+        print("Starting models ...")
+        self.detector = ObjectDetection(confidence=0.05)        # threshold applied per call
+        self.classifier = ImageClassification(confidence=0.0)    # keep all scores; threshold applied below
+        self.det_size, self.det_desc = model_params(self.detector)
+        _, self.cls_desc = model_params(self.classifier)
+
+        if Camera is not None:
+            self.cam = Camera(resolution=(CAPTURE_WIDTH, CAPTURE_HEIGHT), fps=10)
+            self.cam.start()
+            self.read = self.cam.capture
+        else:
+            self.cam = cv2.VideoCapture(0)
+            self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
+            self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
+            self.read = lambda: (lambda r: r[1] if r[0] else None)(self.cam.read())
+
         os.makedirs(OUT_DIR, exist_ok=True)
         self.log_path = os.path.join(OUT_DIR, "log.csv")
         if not os.path.exists(self.log_path):
             with open(self.log_path, "w", newline="") as f:
                 csv.writer(f).writerow(["time", "trigger", "night", "light", "frame", "label",
                                         "det_conf", "species", "species_conf", "x", "y", "w", "h", "file"])
+        self.setup_ui()
+
+    # ---- web page
+
+    def setup_ui(self):
+        self.ui = WebUI()
+        if Camera is not None and hasattr(self.ui, "expose_camera"):
+            self.ui.expose_camera("/camera", self.cam, jpeg_quality=70)
+        self.ui.on_connect(lambda sid: self.send_state())
+        self.ui.on_message("capture", lambda sid, data: self.manual_capture(bool(data.get("ir"))))
+        self.ui.on_message("set_mode", lambda sid, data: self.set_mode(data.get("mode")))
+        self.ui.on_message("set_thresholds", lambda sid, data: self.set_thresholds(data))
+        self.ui.on_message("ir", lambda sid, data: self.bridge_call("ir_on" if data.get("on") else "ir_off"))
+
+    def state(self):
+        return {"mode": self.mode, "timer_s": TIMER_INTERVAL_S, "busy": self.busy,
+                "det_thr": self.det_thr, "cls_thr": self.cls_thr,
+                "detector": self.det_desc, "classifier": self.cls_desc,
+                "stats": dict(self.stats), "species": self.species_counts.most_common(),
+                "sensors": self.sensors, "stream": Camera is not None}
+
+    def send_state(self):
+        self.ui.send_message("state", self.state())
+        for r in list(self.recent):
+            self.ui.send_message("result", r)
+
+    def manual_capture(self, with_ir):
+        self.events.put(("manual", None, None, with_ir))
+        return {"queued": True}
+
+    def set_mode(self, mode):
+        if mode in ("pir", "timer", "manual"):
+            self.mode = mode
+            self.last_timer = time.time()
+            print(f"Trigger mode -> {mode}")
+        self.ui.send_message("state", self.state())
+
+    def set_thresholds(self, data):
+        self.det_thr = min(max(float(data.get("det_thr", self.det_thr)), 0.05), 0.99)
+        self.cls_thr = min(max(float(data.get("cls_thr", self.cls_thr)), 0.0), 0.99)
+        self.ui.send_message("state", self.state())
+
+    def bridge_call(self, name):
+        try:
+            with self.bridge_lock:
+                return Bridge.call(name, timeout=2)
+        except Exception as e:   # sketch not running / function missing: the page just shows no data
+            if name not in self.bridge_warned:   # warn once per function, not every poll
+                self.bridge_warned.add(name)
+                print(f"Bridge call {name} failed: {e} (is the latest sketch flashed?)")
+            return None
+
+    def poll_sensors(self):
+        raw = self.bridge_call("read_sensors")
+        if isinstance(raw, str) and raw.count(",") == 3:
+            light, night, pir, ir = raw.split(",")
+            self.sensors = {"light": int(light), "night": night == "1", "pir": pir == "1", "ir": ir == "1"}
+            self.ui.send_message("sensors", self.sensors)
+
+    # ---- the two stages
+
+    def detect(self, bgr):
+        """Stage 1: boxes in full-resolution frame pixels."""
+        width, height, mode = self.det_size
+        img, (sx, sy, ox, oy) = to_model_input(bgr, width, height, mode)
+        res = self.detector.detect(png_bytes(img), image_type="png", confidence=self.det_thr) or {}
+        boxes = []
+        for d in res.get("detection", []):
+            x1, y1, x2, y2 = d["bounding_box_xyxy"]          # in model-input pixels
+            boxes.append({
+                "label": d["class_name"], "conf": float(d["confidence"]) / 100,
+                "x": (x1 - ox) / sx, "y": (y1 - oy) / sy,
+                "w": (x2 - x1) / sx, "h": (y2 - y1) / sy,
+            })
+        return boxes
+
+    def classify(self, bgr, box):
+        """Stage 2: crop the box (padded like the training crops) -> (species, confidence, top 3)."""
+        H, W = bgr.shape[:2]
+        px, py = box["w"] * CROP_PAD, box["h"] * CROP_PAD
+        x1, y1 = max(0, int(box["x"] - px)), max(0, int(box["y"] - py))
+        x2, y2 = min(W, int(box["x"] + box["w"] + px)), min(H, int(box["y"] + box["h"] + py))
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            return None, 0.0, []
+        res = self.classifier.classify(png_bytes(bgr[y1:y2, x1:x2]), image_type="png") or {}
+        scores = sorted(((c["class_name"], float(c["confidence"]) / 100) for c in res.get("classification", [])),
+                        key=lambda kv: -kv[1])
+        if not scores:
+            return None, 0.0, []
+        return scores[0][0], scores[0][1], scores[:3]
+
+    # ---- triggers
 
     # called by the sketch through Bridge.notify("motion", night, light)
     def on_motion(self, night, light):
-        self.events.put(("pir", bool(night), int(light)))
+        self.events.put(("pir", bool(night), int(light), False))
 
-    def grab(self):
-        ok, frame = self.cam.read()
-        return frame if ok else None
-
-    def handle_trigger(self, trigger, night, light):
+    def handle_trigger(self, trigger, night, light, with_ir=False):
         stamp = datetime.datetime.now()
         print(f"[{stamp:%H:%M:%S}] {trigger} trigger (night={night}, light={light})")
+        self.busy = True
+        self.ui.send_message("busy", {"trigger": trigger, "time": f"{stamp:%H:%M:%S}"})
+        if with_ir:
+            self.bridge_call("ir_on")
         for _ in range(WARMUP_FRAMES):  # flush stale frames, let exposure settle
-            self.grab()
+            self.read()
         day_dir = os.path.join(OUT_DIR, f"{stamp:%Y-%m-%d}")
         os.makedirs(day_dir, exist_ok=True)
 
-        rows = []
+        rows, frames = [], []
         for n in range(BURST_FRAMES):
-            bgr = self.grab()
+            bgr = self.read()
             if bgr is None:
                 print("  camera read failed")
                 continue
-            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             t0 = time.time()
-            boxes = detect(self.det, self.det_info, rgb)
+            boxes = self.detect(bgr)
             for b in boxes:
-                b["species"], b["species_conf"] = (None, 0.0)
+                b["species"], b["species_conf"], b["top3"] = None, 0.0, []
                 if b["label"] == "animal":
-                    sp, conf = classify_crop(self.cls, self.cls_info, rgb, b)
-                    b["species"] = sp if conf >= CLASSIFIER_THRESHOLD else "uncertain"
-                    b["species_conf"] = conf
+                    sp, conf, top3 = self.classify(bgr, b)
+                    b["species"] = sp if conf >= self.cls_thr else "uncertain"
+                    b["species_conf"], b["top3"] = conf, top3
             took = time.time() - t0
 
             name = f"{stamp:%H%M%S}_{n}"
+            labelled = annotate(bgr, boxes)
             if boxes or SAVE_EMPTY:
                 # clean copy for retraining, annotated copy for people
                 cv2.imwrite(os.path.join(day_dir, name + ".jpg"), bgr)
-                cv2.imwrite(os.path.join(day_dir, name + "_labelled.jpg"), annotate(bgr, boxes))
+                cv2.imwrite(os.path.join(day_dir, name + "_labelled.jpg"), labelled)
             summary = ", ".join(f"{b['label']}{'/' + b['species'] if b['species'] else ''} "
                                 f"{b['conf']:.2f}" for b in boxes) or "empty, discarded"
             print(f"  frame {n}: {summary} ({took:.1f}s)")
+
+            self.stats["frames"] += 1
+            self.stats["empty" if not boxes else "kept"] += 1
+            for b in boxes:
+                self.stats[b["label"]] += 1
+                if b["species"]:
+                    self.species_counts[b["species"]] += 1
+            frames.append({"n": n, "took": round(took, 2), "saved": bool(boxes or SAVE_EMPTY),
+                           "preview": jpeg_data_url(labelled),
+                           "boxes": [{"label": b["label"], "conf": round(b["conf"], 3),
+                                      "species": b["species"], "species_conf": round(b["species_conf"], 3),
+                                      "top3": [[s, round(c, 3)] for s, c in b["top3"]]} for b in boxes]})
 
             base = [stamp.isoformat(timespec="seconds"), trigger, night, light, n]
             if not boxes:
@@ -241,19 +310,40 @@ class CameraTrap:
 
         with open(self.log_path, "a", newline="") as f:
             csv.writer(f).writerows(rows)
-        if night and Bridge is not None:
-            Bridge.call("ir_off")
-        # motion that happened while we were busy is stale; drop it
+        if night or with_ir:
+            self.bridge_call("ir_off")
+        self.stats["triggers"] += 1
+        self.stats[f"trigger_{trigger}"] += 1
+
+        result = {"time": f"{stamp:%Y-%m-%d %H:%M:%S}", "trigger": trigger, "night": night,
+                  "light": light, "ir": bool(night or with_ir), "frames": frames}
+        self.recent.append(result)
+        self.busy = False
+        self.ui.send_message("result", result)
+        self.ui.send_message("state", self.state())
+        # motion that happened while we were busy is stale; drop it (manual requests are kept)
+        pending = []
         while not self.events.empty():
-            self.events.get_nowait()
+            ev = self.events.get_nowait()
+            if ev[0] == "manual":
+                pending.append(ev)
+        for ev in pending:
+            self.events.put(ev)
 
     def loop(self):
         try:
-            self.handle_trigger(*self.events.get(timeout=1.0))
+            ev = self.events.get(timeout=0.2)
+            if ev[0] == "pir" and self.mode != "pir":
+                return  # PIR events are ignored in timer/manual mode
+            self.handle_trigger(*ev)
         except queue.Empty:
-            if TRIGGER_MODE == "timer" and time.time() - self.last_timer >= TIMER_INTERVAL_S:
-                self.last_timer = time.time()
+            now = time.time()
+            if self.mode == "timer" and now - self.last_timer >= TIMER_INTERVAL_S:
+                self.last_timer = now
                 self.handle_trigger("timer", None, None)
+            elif now - self.last_poll >= SENSOR_POLL_S:
+                self.last_poll = now
+                self.poll_sensors()
 
 
 def annotate(bgr, boxes):
@@ -270,19 +360,7 @@ def annotate(bgr, boxes):
     return out
 
 
-if Bridge is None and TRIGGER_MODE == "pir":
-    print("No App Lab Bridge (running outside App Lab?): the PIR can't reach this script, "
-          "falling back to timer mode")
-    TRIGGER_MODE = "timer"
-
 trap = CameraTrap()
-
-if Bridge is not None:
-    Bridge.provide("motion", trap.on_motion)
-
-print(f"Camera trap ready ({TRIGGER_MODE} mode). Saving to {OUT_DIR}")
-if App is not None:
-    App.run(user_loop=trap.loop)
-else:
-    while True:
-        trap.loop()
+Bridge.provide("motion", trap.on_motion)
+print(f"Camera trap ready ({trap.mode} mode). Saving to {OUT_DIR}. Test page: http://<board>:7000")
+App.run(user_loop=trap.loop)

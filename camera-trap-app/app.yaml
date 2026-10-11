@@ -1,4 +1,25 @@
 name: Edge-AI Camera Trap
-description: PIR-triggered camera trap that runs an Edge Impulse detector and species classifier on the UNO Q
 icon: 🦓
-bricks: []
+description: PIR-triggered camera trap that runs an Edge Impulse detector and species classifier on the UNO Q
+ports: []
+
+# Each brick runs one Edge Impulse model. Replace the two model ids with your own: they
+# are the folder names in ~/.arduino-bricks/models/custom-ei/ (e.g. ei-model-1119962-1).
+#
+# Why the variables: App Lab gives all bricks in an app ONE shared CUSTOM_MODEL_PATH (the
+# board folder shared into the brick containers). With two custom models only the last
+# brick's model folder would be shared, and the other brick fails with
+# "ENOENT: no such file or directory, chmod .../model.eim". Pointing CUSTOM_MODEL_PATH at
+# the parent custom-ei folder shares both models with both bricks.
+bricks:
+- arduino:web_ui                 # test page: http://<board>:7000 (files in assets/)
+- arduino:object_detection:
+    model: ei-model-DETECTOR_ID-VERSION
+    variables:
+      CUSTOM_MODEL_PATH: /home/arduino/.arduino-bricks/models/custom-ei
+      EI_OBJ_DETECTION_MODEL: /home/arduino/.arduino-bricks/models/custom-ei/ei-model-DETECTOR_ID-VERSION/model.eim
+- arduino:image_classification:
+    model: ei-model-CLASSIFIER_ID-VERSION
+    variables:
+      CUSTOM_MODEL_PATH: /home/arduino/.arduino-bricks/models/custom-ei
+      EI_CLASSIFICATION_MODEL: /home/arduino/.arduino-bricks/models/custom-ei/ei-model-CLASSIFIER_ID-VERSION/model.eim

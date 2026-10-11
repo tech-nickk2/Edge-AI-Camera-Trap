@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Camera Trap Test</title>
+  <link rel="stylesheet" href="app.css" />
+</head>
+<body>
+  <header>
+    <div class="title">
+      <span class="logo">🦓</span>
+      <div>
+        <h1>Edge-AI Camera Trap</h1>
+        <p class="sub">Test console</p>
+      </div>
+    </div>
+    <div class="header-right">
+      <span id="busy" class="pill busy hidden">Capturing…</span>
+      <span id="conn" class="pill off">Disconnected</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- live view + controls -->
+    <section class="card live">
+      <div class="card-head">
+        <h2>Live camera</h2>
+        <div class="segmented" id="mode">
+          <button data-mode="pir">PIR</button>
+          <button data-mode="timer">Timer</button>
+          <button data-mode="manual">Manual</button>
+        </div>
+      </div>
+      <div class="stream">
+        <img id="stream" alt="Live camera stream" />
+        <p id="no-stream" class="hint hidden">Live view needs App Lab's Camera peripheral.</p>
+      </div>
+      <div class="actions">
+        <button id="capture" class="primary">Capture now</button>
+        <label class="check"><input type="checkbox" id="capture-ir" /> with IR LEDs</label>
+        <span id="mode-hint" class="hint"></span>
+      </div>
+    </section>
+
+    <!-- sensors -->
+    <section class="card">
+      <div class="card-head"><h2>Sensors</h2></div>
+      <div class="sensor-grid">
+        <div class="sensor">
+          <span class="label">Light (LDR)</span>
+          <span class="value" id="s-light">–</span>
+          <div class="bar"><div id="s-light-bar"></div></div>
+        </div>
+        <div class="sensor">
+          <span class="label">Day / night</span>
+          <span class="value" id="s-night">–</span>
+        </div>
+        <div class="sensor">
+          <span class="label">PIR motion</span>
+          <span class="value"><span id="s-pir" class="dot"></span><span id="s-pir-text">–</span></span>
+        </div>
+        <div class="sensor">
+          <span class="label">IR LEDs</span>
+          <span class="value"><span id="s-ir" class="dot"></span><span id="s-ir-text">–</span></span>
+          <div class="mini-actions">
+            <button data-ir="1">On</button><button data-ir="0">Off</button>
+          </div>
+        </div>
+      </div>
+      <p class="hint">Readings refresh every second. IR LEDs switch off by themselves after 15 s.</p>
+    </section>
+
+    <!-- thresholds + models -->
+    <section class="card">
+      <div class="card-head"><h2>Thresholds</h2></div>
+      <label class="slider">
+        <span>Detector confidence <b id="det-val">–</b></span>
+        <input type="range" id="det-thr" min="0.05" max="0.95" step="0.05" />
+      </label>
+      <label class="slider">
+        <span>Species confidence <b id="cls-val">–</b></span>
+        <input type="range" id="cls-thr" min="0" max="0.95" step="0.05" />
+      </label>
+      <p class="hint">Below the species confidence, an animal is reported as "uncertain".</p>
+      <div class="models">
+        <div><span class="label">Detector</span><span id="m-det">–</span></div>
+        <div><span class="label">Species classifier</span><span id="m-cls">–</span></div>
+      </div>
+    </section>
+
+    <!-- statistics -->
+    <section class="card stats-card">
+      <div class="card-head"><h2>Statistics</h2><span class="hint">since the app started</span></div>
+      <div class="stats">
+        <div><b id="st-triggers">0</b><span>triggers</span></div>
+        <div><b id="st-frames">0</b><span>frames</span></div>
+        <div><b id="st-empty">0</b><span>empty, discarded</span></div>
+        <div><b id="st-animal">0</b><span>animals</span></div>
+        <div><b id="st-person">0</b><span>people</span></div>
+        <div><b id="st-vehicle">0</b><span>vehicles</span></div>
+      </div>
+      <div id="species-chips" class="chips"></div>
+    </section>
+
+    <!-- results -->
+    <section class="card results">
+      <div class="card-head"><h2>Results</h2><span class="hint">newest first</span></div>
+      <div id="results"><p class="hint" id="no-results">No captures yet. Press "Capture now" or trigger the PIR.</p></div>
+    </section>
+  </main>
+
+  <script src="libs/socket.io.min.js"></script>
+  <script src="libs/arduino.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
