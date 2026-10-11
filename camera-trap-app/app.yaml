@@ -1,0 +1,4 @@
+name: Edge-AI Camera Trap
+description: PIR-triggered camera trap that runs an Edge Impulse detector and species classifier on the UNO Q
+icon: 🦓
+bricks: []

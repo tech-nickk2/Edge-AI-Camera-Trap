@@ -1,0 +1,8 @@
+# datasets and caches (downloaded by the training scripts; never commit)
+.lila_cache/
+ei_*/
+__pycache__/
+
+# camera trap output and local models
+camera-trap-app/captures/
+*.eim
