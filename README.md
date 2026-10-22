@@ -3,8 +3,8 @@
 An on-device AI camera trap that discards empty shots and labels animals, people and
 vehicles: MegaDetector brought to the edge.
 
-<!-- Add a photo of the finished prototype here -->
-![The camera trap prototype](images/prototype.jpg)
+<img width="4000" height="3000" alt="20261022_170153" src="https://github.com/user-attachments/assets/5c8932a7-f451-4783-ac28-ef18c68c4e9f" />
+
 
 Full write-up: [Hackster.io article](<HACKSTER LINK>)
 
@@ -241,8 +241,11 @@ Two separate [Edge Impulse](https://studio.edgeimpulse.com) projects:
 Choose **"Fit longest axis"** in both projects: the app on the board resizes images the
 same way.
 
-<!-- Add a screenshot of the Edge Impulse results here -->
-![Edge Impulse training results](images/edge-impulse-results.png)
+<img width="831" height="812" alt="Screenshot 2026-10-12 014405" src="https://github.com/user-attachments/assets/1459d15d-7220-41f8-8cbe-90507369631e" />
+
+
+<img width="812" height="709" alt="Screenshot 2026-10-12 014555" src="https://github.com/user-attachments/assets/71190241-8e1b-4b39-b5b5-0d6a7e16f364" />
+
 
 ---
 
@@ -318,8 +321,8 @@ and vehicles never reach the second model.
 The camera must be able to see infrared for night photos. Most webcams have an IR-cut
 filter that blocks it, so use a NoIR camera or remove the filter.
 
-<!-- Add a wiring diagram / photo here -->
-![Wiring](images/wiring.jpg)
+<img width="1490" height="571" alt="Screenshot 2026-10-13 004906" src="https://github.com/user-attachments/assets/df53485a-d8b0-4043-8816-a853b75a3e62" />
+
 
 ### Install and run
 
@@ -366,8 +369,13 @@ filter that blocks it, so use a NoIR camera or remove the filter.
 
 Settings and troubleshooting: [camera-trap-app/README.md](camera-trap-app/README.md).
 
-<!-- Add a labelled output photo from data/captures/ here -->
-![Example labelled capture](images/example-capture.jpg)
+<img width="945" height="708" alt="Screenshot 2026-10-08 215502" src="https://github.com/user-attachments/assets/a7477e84-6a09-4da2-9c70-9f6eff880b06" />
+
+
+<img width="941" height="842" alt="Screenshot 2026-10-08 211645" src="https://github.com/user-attachments/assets/bdb35c1e-7a89-447a-9b9b-eac708fe7f10" />
+
+
+
 
 ---
 
