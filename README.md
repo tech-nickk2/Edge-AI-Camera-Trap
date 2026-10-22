@@ -239,11 +239,12 @@ Two separate [Edge Impulse](https://studio.edgeimpulse.com) projects:
 Choose **"Fit longest axis"** in both projects: the app on the board resizes images the
 same way.
 
-**species classifier Results**
+
+**Detector Results**
 
 <img width="831" height="812" alt="Screenshot 2026-10-12 014405" src="https://github.com/user-attachments/assets/1459d15d-7220-41f8-8cbe-90507369631e" />
 
-**Detector Results**
+**Species classifier Results**
 
 <img width="812" height="709" alt="Screenshot 2026-10-12 014555" src="https://github.com/user-attachments/assets/71190241-8e1b-4b39-b5b5-0d6a7e16f364" />
 
